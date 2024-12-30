@@ -1,13 +1,10 @@
 from flask import Flask, request, jsonify
-import pandas as pd
 from dotenv import load_dotenv
 import os
 import logging
-import uuid
 
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.cluster import Cluster
-from cassandra.query import BatchStatement
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
@@ -54,76 +51,9 @@ except Exception as e:
     logger.error(f"Error setting keyspace: {e}")
     exit(1)
 
-# Function to create table if it doesn't exist
-def create_table():
-    create_table_query = """
-    CREATE TABLE IF NOT EXISTS engagement (
-        id uuid PRIMARY KEY,
-        post_type text,
-        likes int,
-        comments int,
-        shares int,
-        total_engagement int
-    )
-    """
-    try:
-        session.execute(create_table_query)
-        logger.info("Table 'engagement' is ready with UUID as PRIMARY KEY.")
-    except Exception as e:
-        logger.error(f"Error creating table: {e}")
-        exit(1)
-
-# Load data from CSV
-try:
-    data = pd.read_csv('social_media_engagement_data.csv')
-    logger.info("Successfully loaded social_media_engagement_data.csv")
-except Exception as e:
-    logger.error(f"Error loading CSV file: {e}")
-    exit(1)
-
-# Function to insert data into the table
-def insert_data():
-    create_table()  # Ensure table exists
-
-    insert_query = session.prepare("""
-    INSERT INTO engagement (id, post_type, likes, comments, shares, total_engagement)
-    VALUES (?, ?, ?, ?, ?, ?)
-    """)
-
-    batch = BatchStatement()
-    for index, row in data.iterrows():
-        record = (
-            uuid.uuid4(),  # Generate a unique UUID for each row
-            row['Post Type'],
-            int(row['Likes']),
-            int(row['Comments']),
-            int(row['Shares']),
-            int(row['Total Engagement'])
-        )
-        batch.add(insert_query, record)
-        
-        # Execute the batch every 100 records
-        if (index + 1) % 100 == 0:
-            try:
-                session.execute(batch)
-                logger.info(f"Inserted {index + 1} records.")
-                batch.clear()
-            except Exception as e:
-                logger.error(f"Error inserting batch at index {index + 1}: {e}")
-
-    # Execute any remaining records
-    try:
-        session.execute(batch)
-        logger.info("Data insertion completed.")
-    except Exception as e:
-        logger.error(f"Error inserting final batch: {e}")
-
 # Flask app factory function
 def create_app():
     app = Flask(__name__)
-
-    # Insert data during app initialization
-    insert_data()
 
     # Route to analyze post performance
     @app.route('/analyze', methods=['GET'])
