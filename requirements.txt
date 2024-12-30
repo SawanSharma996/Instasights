@@ -1,0 +1,6 @@
+Flask
+pandas
+cassandra-driver
+openai
+astrapy
+python-dotenv
