@@ -1,34 +1,40 @@
-from flask import Flask, request, jsonify
+import pandas as pd
 from dotenv import load_dotenv
 import os
 import logging
+import uuid
 
 from cassandra.auth import PlainTextAuthProvider
 from cassandra.cluster import Cluster
+from cassandra.query import BatchStatement
+
+# LangChain (for vector search)
+from langchain_openai import OpenAIEmbeddings
+from langchain_astradb import AstraDBVectorStore
 
 # Setup Logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-logger.info("Application started")
-
-# Load environment variables from .env file
+# Load environment variables from .env
 load_dotenv()
 
-# Initialize the Astra DB client using DataStax Driver
+# Astra DB connection configuration
 ASTRA_DB_CONFIG = {
     'secure_connect_bundle': os.getenv('SECURE_CONNECT_BUNDLE'),
-    'username': 'token',  # Use 'token' as the username
-    'password': os.getenv('ASTRA_PASSWORD')  # Your generated Database Token
+    'username': 'token',  # 'token' as the username
+    'password': os.getenv('ASTRA_PASSWORD'),
+    'api_endpoint': os.getenv('ASTRA_DB_API_ENDPOINT')
 }
 
-# Setup authentication provider
-auth_provider = PlainTextAuthProvider(
-    ASTRA_DB_CONFIG['username'],
-    ASTRA_DB_CONFIG['password']
-)
+# Optional embedding API key for vector search
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 
-# Initialize cluster connection
+# Connect to Astra DB
+auth_provider = PlainTextAuthProvider(
+    username=ASTRA_DB_CONFIG['username'],
+    password=ASTRA_DB_CONFIG['password']
+)
 try:
     cluster = Cluster(
         cloud={'secure_connect_bundle': ASTRA_DB_CONFIG['secure_connect_bundle']},
@@ -40,10 +46,8 @@ except Exception as e:
     logger.error(f"Failed to connect to Astra DB: {e}")
     exit(1)
 
-# Define your keyspace
-KEYSPACE = os.getenv('KEYSPACE')  # Ensure this is set in your .env
-
-# Connect to the specified keyspace
+# Keyspace
+KEYSPACE = os.getenv('KEYSPACE') or "default_keyspace"
 try:
     session.set_keyspace(KEYSPACE)
     logger.info(f"Using keyspace: {KEYSPACE}")
@@ -51,63 +55,96 @@ except Exception as e:
     logger.error(f"Error setting keyspace: {e}")
     exit(1)
 
-# Flask app factory function
-def create_app():
-    app = Flask(__name__)
+# Initialize Vector Store
+vector_store = None
+if OPENAI_API_KEY:
+    try:
+        embedding = OpenAIEmbeddings(openai_api_key=OPENAI_API_KEY)
+        vector_store = AstraDBVectorStore(
+            embedding=embedding,
+            collection_name="engagement_store",
+            token=os.getenv('ASTRA_DB_APPLICATION_TOKEN'),
+            api_endpoint=ASTRA_DB_CONFIG['api_endpoint']
+        )
+        logger.info("Astra Vector Store initialized with OpenAI embeddings.")
+    except Exception as e:
+        logger.warning(f"Astra Vector Store not configured properly: {e}")
 
-    # Route to analyze post performance
-    @app.route('/analyze', methods=['GET'])
-    def analyze():
-        post_type = request.args.get('post_type')
-        if not post_type:
-            return jsonify({"error": "Please provide a 'post_type' parameter."}), 400
+# Load dataset
+try:
+    data = pd.read_csv('social_media_engagement_data.csv')
+    logger.info("Successfully loaded social_media_engagement_data.csv")
+except Exception as e:
+    logger.error(f"Error loading CSV file: {e}")
+    exit(1)
 
+# Insert data into vector store
+def insert_data():
+    if not vector_store:
+        logger.error("Vector store is not initialized. Exiting data insertion.")
+        return
+
+    batch_size = 100
+    records_to_vectorize = []
+
+    for index, row in data.iterrows():
         try:
-            select_query = session.prepare("""
-            SELECT likes, comments, shares, total_engagement FROM engagement WHERE post_type = ?
-            """)
+            desc = row['post_type']
+            metadata = {
+                "content": desc,
+                "id": str(uuid.uuid4()),
+                "likes": int(row['likes']),
+                "comments": int(row['comments']),
+                "shares": int(row['shares']),
+                "total_engagement": int(row['total_engagement'])
+            }
+            records_to_vectorize.append({"text": desc, "metadata": metadata})
 
-            rows = session.execute(select_query, (post_type,))
-
-            likes = [row.likes for row in rows]
-            comments = [row.comments for row in rows]
-            shares = [row.shares for row in rows]
-            total_engagement = [row.total_engagement for row in rows]
-
-            return jsonify({
-                'post_type': post_type,
-                'avg_likes': sum(likes) / len(likes) if likes else 0,
-                'avg_comments': sum(comments) / len(comments) if comments else 0,
-                'avg_shares': sum(shares) / len(shares) if shares else 0,
-                'avg_total_engagement': sum(total_engagement) / len(total_engagement) if total_engagement else 0
-            })
-
+            if (index + 1) % batch_size == 0:
+                _flush_to_vector_store(records_to_vectorize)
+                logger.info(f"Vectorized and stored records up to index {index + 1}.")
+                records_to_vectorize = []
         except Exception as e:
-            logger.error(f"Error during analysis: {e}")
-            return jsonify({"error": str(e)}), 500
+            logger.error(f"Error processing row {index + 1}: {e}")
 
-    # Route to fetch all post types
-    @app.route('/post_types', methods=['GET'])
-    def get_post_types():
-        try:
-            select_query = session.prepare("""
-            SELECT DISTINCT post_type FROM engagement
-            """)
+    # Insert remaining
+    if records_to_vectorize:
+        _flush_to_vector_store(records_to_vectorize)
+        logger.info("Vectorized and stored remaining 'post_type' fields.")
 
-            rows = session.execute(select_query)
+def _flush_to_vector_store(records):
+    texts = [r['text'] for r in records]
+    metadatas = [r['metadata'] for r in records]
+    try:
+        vector_store.add_texts(texts=texts, metadatas=metadatas)
+    except Exception as ve:
+        logger.error(f"Error vectorizing records: {ve}")
 
-            post_types = list(set(row.post_type for row in rows))
-            return jsonify({"post_types": post_types})
-        except Exception as e:
-            logger.error(f"Error fetching post types: {e}")
-            return jsonify({"error": str(e)}), 500
+# Simple analysis function
+def analyze_post_type(post_type: str, top_k=5):
+    if not vector_store:
+        logger.error("Vector store not initialized.")
+        return []
+    try:
+        results = vector_store.similarity_search(post_type, k=top_k)
+        return [
+            {
+                "id": r.metadata["id"],
+                "post_type": r.metadata["content"],
+                "likes": r.metadata["likes"],
+                "comments": r.metadata["comments"],
+                "shares": r.metadata["shares"],
+                "total_engagement": r.metadata["total_engagement"]
+            }
+            for r in results
+        ]
+    except Exception as e:
+        logger.error(f"Error performing similarity search: {e}")
+        return []
 
-    @app.route('/')
-    def index():
-        return "Social Media Performance Analysis API"
-
-    return app
-
-if __name__ == '__main__':
-    app = create_app()
-    app.run(debug=True, use_reloader=False)
+# Example usage
+if __name__ == "__main__":
+    insert_data()
+    # Example: analyze "carousel" posts
+    similar_posts = analyze_post_type("carousel", top_k=3)
+    logger.info(f"Similar 'carousel' posts: {similar_posts}")
