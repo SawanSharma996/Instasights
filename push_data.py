@@ -107,7 +107,6 @@ def insert_data():
         except Exception as e:
             logger.error(f"Error processing row {index + 1}: {e}")
 
-    # Insert remaining
     if records_to_vectorize:
         _flush_to_vector_store(records_to_vectorize)
         logger.info("Vectorized and stored remaining 'post_type' fields.")
@@ -120,7 +119,7 @@ def _flush_to_vector_store(records):
     except Exception as ve:
         logger.error(f"Error vectorizing records: {ve}")
 
-# Simple analysis function
+# analysis function
 def analyze_post_type(post_type: str, top_k=5):
     if not vector_store:
         logger.error("Vector store not initialized.")
@@ -142,7 +141,6 @@ def analyze_post_type(post_type: str, top_k=5):
         logger.error(f"Error performing similarity search: {e}")
         return []
 
-# Example usage
 if __name__ == "__main__":
     insert_data()
     # Example: analyze "carousel" posts
